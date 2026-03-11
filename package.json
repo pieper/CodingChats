@@ -1,0 +1,80 @@
+{
+  "name": "coding-chats",
+  "displayName": "CodingChats",
+  "description": "Automatically captures Claude Code conversation transcripts and commits them to a git repository for future reference by developers and AI agents.",
+  "version": "0.1.0",
+  "publisher": "pieper",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pieper/CodingChats.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "CodingChats",
+      "properties": {
+        "codingChats.conversationsRepoPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the local git repo where conversations are stored. If empty, defaults to ~/CodingChats-conversations."
+        },
+        "codingChats.autoCommit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically commit new transcript data when sessions end or go idle."
+        },
+        "codingChats.autoPush": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically push after each commit. Requires a remote to be configured."
+        },
+        "codingChats.debounceSeconds": {
+          "type": "number",
+          "default": 30,
+          "description": "Seconds to wait after the last transcript change before committing."
+        },
+        "codingChats.claudeProjectsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Claude Code projects directory. If empty, defaults to ~/.claude/projects."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "codingChats.commitNow",
+        "title": "CodingChats: Commit Conversations Now"
+      },
+      {
+        "command": "codingChats.openConversation",
+        "title": "CodingChats: Open Latest Conversation"
+      },
+      {
+        "command": "codingChats.showStatus",
+        "title": "CodingChats: Show Status"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
