@@ -35,9 +35,9 @@ git commit -m "Initial conversations repo"
 git push -u origin main
 ```
 
-### 2. Install the extension
+### 2. Build the extension
 
-Clone this repo and build:
+Requires Node.js >= 20.
 
 ```bash
 git clone https://github.com/pieper/CodingChats.git
@@ -45,12 +45,29 @@ cd CodingChats
 npm install
 npm run compile
 npm run package
-code --install-extension coding-chats-*.vsix
 ```
 
-Or for development, open the CodingChats folder in VS Code and press F5 to launch with the extension loaded.
+This produces a `coding-chats-<version>.vsix` file in the project directory.
 
-### 3. Configure (optional)
+### 3. Install the extension
+
+**From the command line:**
+
+```bash
+code --install-extension coding-chats-0.1.0.vsix
+```
+
+**From the VS Code GUI:**
+
+1. Open the Extensions sidebar (**Cmd+Shift+X** / **Ctrl+Shift+X**)
+2. Click the `...` menu at the top of the sidebar
+3. Choose **Install from VSIX...** and select the `.vsix` file
+
+After installing, reload the window (**Cmd+Shift+P** / **Ctrl+Shift+P** → **Developer: Reload Window**) to activate the extension.
+
+**For development**, open the CodingChats folder in VS Code and press **F5** to launch an Extension Development Host with the extension loaded.
+
+### 4. Configure (optional)
 
 The extension works with zero configuration — it will create `~/CodingChats-conversations` automatically if it doesn't exist. To point it at your cloned GitHub repo instead:
 
@@ -65,7 +82,7 @@ Open VS Code Settings and search for "CodingChats", or add to your `settings.jso
 }
 ```
 
-### 4. Push conversations to GitHub
+### 5. Push conversations to GitHub
 
 If you set `codingChats.autoPush` to `true`, conversations are pushed automatically after each commit.
 
