@@ -1,3 +1,6 @@
+> [!WARNING]
+> This is an experimental, AI-assisted project. Please use with caution as it is a work in progress.
+
 # CodingChats
 
 A VS Code extension that automatically captures [Claude Code](https://claude.com/claude-code) conversation transcripts and commits them to a git repository.
