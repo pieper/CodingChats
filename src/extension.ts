@@ -644,6 +644,37 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+/**
+ * Check if the user has a CodingChats-conversations repo on GitHub.
+ * Uses `gh repo list` to search. Returns "owner/repo" if found, null otherwise.
+ */
+async function findGitHubConversationsRepo(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("gh", [
+      "repo",
+      "list",
+      "--json",
+      "nameWithOwner",
+      "--jq",
+      '.[].nameWithOwner',
+      "--limit",
+      "200",
+    ]);
+    const repos = stdout.trim().split("\n");
+    const match = repos.find((r) =>
+      r.toLowerCase().endsWith("/codingchats-conversations")
+    );
+    if (match) {
+      log(`Found existing GitHub repo: ${match}`);
+      return match;
+    }
+  } catch (err: unknown) {
+    const error = err as Error;
+    log(`gh repo list failed (gh CLI may not be installed): ${error.message}`);
+  }
+  return null;
+}
+
 async function initialSetup() {
   const defaultPath = path.join(os.homedir(), "CodingChats-conversations");
   const config = vscode.workspace.getConfiguration("codingChats");
@@ -651,49 +682,113 @@ async function initialSetup() {
   // If the user already configured a path in settings, skip the location prompt
   const configuredPath = config.get<string>("conversationsRepoPath");
   if (!configuredPath) {
-    const locationChoice = await vscode.window.showInformationMessage(
-      `CodingChats will store conversations in: ${defaultPath}`,
-      "Use Default",
-      "Choose Location",
-      "Select Existing Repo"
-    );
+    // Check if the user already has a CodingChats-conversations repo on GitHub
+    const ghRepo = await findGitHubConversationsRepo();
 
-    if (locationChoice === "Choose Location") {
-      const picked = await vscode.window.showOpenDialog({
-        canSelectFiles: false,
-        canSelectFolders: true,
-        canSelectMany: false,
-        openLabel: "Select folder for conversations repo",
-        title: "Choose where to create the CodingChats conversations repo",
-      });
-      if (picked && picked.length > 0) {
-        const chosenPath = picked[0].fsPath;
-        await config.update(
-          "conversationsRepoPath",
-          chosenPath,
-          vscode.ConfigurationTarget.Global
-        );
-        log(`Conversations repo path set to: ${chosenPath}`);
+    if (ghRepo) {
+      const cloneChoice = await vscode.window.showInformationMessage(
+        `Found existing repo on GitHub: ${ghRepo}. Clone it?`,
+        "Clone to Default Location",
+        "Clone to Custom Location",
+        "Skip (Start Fresh)"
+      );
+
+      if (
+        cloneChoice === "Clone to Default Location" ||
+        cloneChoice === "Clone to Custom Location"
+      ) {
+        let clonePath = defaultPath;
+        if (cloneChoice === "Clone to Custom Location") {
+          const picked = await vscode.window.showOpenDialog({
+            canSelectFiles: false,
+            canSelectFolders: true,
+            canSelectMany: false,
+            openLabel: "Select folder to clone into",
+            title:
+              "Choose parent directory for the CodingChats conversations repo",
+          });
+          if (picked && picked.length > 0) {
+            clonePath = path.join(picked[0].fsPath, "CodingChats-conversations");
+          }
+        }
+
+        if (!fs.existsSync(clonePath)) {
+          try {
+            await execFileAsync("gh", [
+              "repo",
+              "clone",
+              ghRepo,
+              clonePath,
+            ]);
+            log(`Cloned ${ghRepo} to ${clonePath}`);
+          } catch (err: unknown) {
+            const error = err as Error;
+            log(`Failed to clone ${ghRepo}: ${error.message}`);
+            vscode.window.showWarningMessage(
+              `CodingChats: Could not clone ${ghRepo} — ${error.message}`
+            );
+          }
+        } else {
+          log(
+            `Clone target already exists: ${clonePath}, using it as-is`
+          );
+        }
+
+        if (clonePath !== defaultPath) {
+          await config.update(
+            "conversationsRepoPath",
+            clonePath,
+            vscode.ConfigurationTarget.Global
+          );
+        }
       }
-    } else if (locationChoice === "Select Existing Repo") {
-      const picked = await vscode.window.showOpenDialog({
-        canSelectFiles: false,
-        canSelectFolders: true,
-        canSelectMany: false,
-        openLabel: "Select existing conversations repo",
-        title: "Select an existing CodingChats conversations repo",
-      });
-      if (picked && picked.length > 0) {
-        const chosenPath = picked[0].fsPath;
-        await config.update(
-          "conversationsRepoPath",
-          chosenPath,
-          vscode.ConfigurationTarget.Global
-        );
-        log(`Conversations repo path set to existing repo: ${chosenPath}`);
+      // "Skip" falls through to normal setup
+    } else {
+      // No GitHub repo found — offer standard location choices
+      const locationChoice = await vscode.window.showInformationMessage(
+        `CodingChats will store conversations in: ${defaultPath}`,
+        "Use Default",
+        "Choose Location",
+        "Select Existing Repo"
+      );
+
+      if (locationChoice === "Choose Location") {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: "Select folder for conversations repo",
+          title: "Choose where to create the CodingChats conversations repo",
+        });
+        if (picked && picked.length > 0) {
+          const chosenPath = picked[0].fsPath;
+          await config.update(
+            "conversationsRepoPath",
+            chosenPath,
+            vscode.ConfigurationTarget.Global
+          );
+          log(`Conversations repo path set to: ${chosenPath}`);
+        }
+      } else if (locationChoice === "Select Existing Repo") {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: "Select existing conversations repo",
+          title: "Select an existing CodingChats conversations repo",
+        });
+        if (picked && picked.length > 0) {
+          const chosenPath = picked[0].fsPath;
+          await config.update(
+            "conversationsRepoPath",
+            chosenPath,
+            vscode.ConfigurationTarget.Global
+          );
+          log(`Conversations repo path set to existing repo: ${chosenPath}`);
+        }
       }
+      // "Use Default" or dismissed — leave the setting empty so getConfig() uses the default
     }
-    // "Use Default" or dismissed — leave the setting empty so getConfig() uses the default
   }
 
   extensionContext.globalState.update("hasCompletedSetup", true);
