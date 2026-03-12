@@ -24,12 +24,17 @@ interface SessionInfo {
   debounceTimer?: ReturnType<typeof setTimeout>;
 }
 
+// Cache resolved project names so we don't shell out to git repeatedly
+const projectNameCache: Map<string, string> = new Map();
+
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem;
 let fileWatchers: fs.FSWatcher[] = [];
 let activeSessions: Map<string, SessionInfo> = new Map();
+let extensionContext: vscode.ExtensionContext;
 
 export function activate(context: vscode.ExtensionContext) {
+  extensionContext = context;
   outputChannel = vscode.window.createOutputChannel("CodingChats");
   log("CodingChats extension activated");
 
@@ -55,8 +60,20 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("codingChats.showStatus", showStatus)
   );
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codingChats.importExisting",
+      importExistingTranscripts
+    )
+  );
 
   startWatching();
+
+  // On first activation, offer to import existing transcripts
+  const hasImported = context.globalState.get<boolean>("hasOfferedImport");
+  if (!hasImported) {
+    offerInitialImport();
+  }
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -70,7 +87,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   stopWatching();
-  // Flush any pending commits
   for (const session of activeSessions.values()) {
     if (session.debounceTimer) {
       clearTimeout(session.debounceTimer);
@@ -104,16 +120,92 @@ function log(msg: string) {
   outputChannel.appendLine(`[${timestamp}] ${msg}`);
 }
 
+// --- Project name resolution ---
+
+/**
+ * Recover the local filesystem path from a Claude project hash.
+ * Claude Code encodes the working directory as: slashes → dashes, with a leading dash.
+ * e.g. "-Users-pieper-slicer-latest-SlicerTissue" → "/Users/pieper/slicer/latest/SlicerTissue"
+ */
+function projectHashToLocalPath(projectHash: string): string {
+  // Replace leading dash and convert remaining dashes to slashes
+  return "/" + projectHash.replace(/^-/, "").replace(/-/g, "/");
+}
+
+/**
+ * Parse "owner/repo" from a git remote URL.
+ * Handles: git@github.com:owner/repo.git, https://github.com/owner/repo.git, etc.
+ */
+function parseOwnerRepo(remoteUrl: string): string | null {
+  // SSH: git@github.com:owner/repo.git
+  const sshMatch = remoteUrl.match(/[:\/]([^/]+)\/([^/]+?)(?:\.git)?\s*$/);
+  if (sshMatch) {
+    return `${sshMatch[1]}/${sshMatch[2]}`;
+  }
+  // HTTPS: https://github.com/owner/repo.git
+  const httpsMatch = remoteUrl.match(
+    /\/\/[^/]+\/([^/]+)\/([^/]+?)(?:\.git)?\s*$/
+  );
+  if (httpsMatch) {
+    return `${httpsMatch[1]}/${httpsMatch[2]}`;
+  }
+  return null;
+}
+
+/**
+ * Resolve a Claude project hash to an "owner/repo" folder name by:
+ * 1. Recovering the local path from the hash
+ * 2. Running `git remote get-url origin` in that directory
+ * 3. Parsing owner/repo from the remote URL
+ *
+ * Falls back to the last path component if git remote fails (not a git repo,
+ * no remote, directory doesn't exist on this machine, etc.)
+ */
+async function resolveProjectName(projectHash: string): Promise<string> {
+  const cached = projectNameCache.get(projectHash);
+  if (cached) return cached;
+
+  const localPath = projectHashToLocalPath(projectHash);
+
+  // Try git remote origin
+  if (fs.existsSync(localPath)) {
+    try {
+      const { stdout } = await execFileAsync("git", [
+        "-C",
+        localPath,
+        "remote",
+        "get-url",
+        "origin",
+      ]);
+      const ownerRepo = parseOwnerRepo(stdout.trim());
+      if (ownerRepo) {
+        projectNameCache.set(projectHash, ownerRepo);
+        log(`Resolved ${projectHash} → ${ownerRepo}`);
+        return ownerRepo;
+      }
+    } catch {
+      // Not a git repo or no remote — fall through
+    }
+  }
+
+  // Fallback: use the last component of the recovered path
+  const fallback = path.basename(localPath);
+  projectNameCache.set(projectHash, fallback);
+  log(`Resolved ${projectHash} → ${fallback} (fallback, no git remote)`);
+  return fallback;
+}
+
+// --- File watching ---
+
 function startWatching() {
   const { claudeProjectsPath } = getConfig();
 
   if (!fs.existsSync(claudeProjectsPath)) {
     log(`Claude projects directory not found: ${claudeProjectsPath}`);
     log("Will retry when directory appears...");
-    // Watch parent dir for creation
     const parentDir = path.dirname(claudeProjectsPath);
     if (fs.existsSync(parentDir)) {
-      const parentWatcher = fs.watch(parentDir, (event, filename) => {
+      const parentWatcher = fs.watch(parentDir, (_event, filename) => {
         if (filename === path.basename(claudeProjectsPath)) {
           parentWatcher.close();
           startWatching();
@@ -126,11 +218,10 @@ function startWatching() {
 
   log(`Watching for transcripts in: ${claudeProjectsPath}`);
 
-  // Watch the projects directory for new project hash directories
   const projectsWatcher = fs.watch(
     claudeProjectsPath,
     { recursive: true },
-    (event, filename) => {
+    (_event, filename) => {
       if (!filename || !filename.endsWith(".jsonl")) {
         return;
       }
@@ -140,7 +231,6 @@ function startWatching() {
   );
   fileWatchers.push(projectsWatcher);
 
-  // Scan for existing JSONL files
   scanExistingTranscripts(claudeProjectsPath);
 }
 
@@ -151,31 +241,28 @@ function stopWatching() {
   fileWatchers = [];
 }
 
+/**
+ * Find the project hash directory for a transcript path.
+ * Transcripts can be at:
+ *   <projects>/<projectHash>/<session>.jsonl          (main session)
+ *   <projects>/<projectHash>/<session>/subagents/*.jsonl (subagents)
+ * In both cases we want the projectHash (first directory under projects/).
+ */
+function getProjectHashFromPath(
+  transcriptPath: string,
+  projectsDir: string
+): string {
+  const rel = path.relative(projectsDir, transcriptPath);
+  return rel.split(path.sep)[0];
+}
+
 function scanExistingTranscripts(projectsDir: string) {
   try {
     const entries = fs.readdirSync(projectsDir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const projectDir = path.join(projectsDir, entry.name);
-      try {
-        const files = fs.readdirSync(projectDir);
-        for (const file of files) {
-          if (file.endsWith(".jsonl")) {
-            const fullPath = path.join(projectDir, file);
-            // Track but don't immediately commit existing files
-            const stat = fs.statSync(fullPath);
-            const sessionId = path.basename(file, ".jsonl");
-            activeSessions.set(fullPath, {
-              projectHash: entry.name,
-              sessionId,
-              transcriptPath: fullPath,
-              lastSize: stat.size,
-            });
-          }
-        }
-      } catch {
-        // Skip unreadable directories
-      }
+      collectJsonlFiles(projectDir, entry.name);
     }
     log(`Found ${activeSessions.size} existing transcript(s)`);
   } catch {
@@ -183,8 +270,32 @@ function scanExistingTranscripts(projectsDir: string) {
   }
 }
 
+function collectJsonlFiles(dir: string, projectHash: string) {
+  try {
+    const items = fs.readdirSync(dir, { withFileTypes: true });
+    for (const item of items) {
+      const fullPath = path.join(dir, item.name);
+      if (item.isFile() && item.name.endsWith(".jsonl")) {
+        const stat = fs.statSync(fullPath);
+        const sessionId = item.name.replace(".jsonl", "");
+        activeSessions.set(fullPath, {
+          projectHash,
+          sessionId,
+          transcriptPath: fullPath,
+          lastSize: stat.size,
+        });
+      } else if (item.isDirectory()) {
+        // Recurse into session/subagents directories
+        collectJsonlFiles(fullPath, projectHash);
+      }
+    }
+  } catch {
+    // Skip unreadable dirs
+  }
+}
+
 function handleTranscriptChange(transcriptPath: string) {
-  const { debounceSeconds, autoCommit } = getConfig();
+  const { debounceSeconds, autoCommit, claudeProjectsPath } = getConfig();
 
   if (!fs.existsSync(transcriptPath)) return;
 
@@ -192,10 +303,10 @@ function handleTranscriptChange(transcriptPath: string) {
   const existing = activeSessions.get(transcriptPath);
 
   if (existing && stat.size === existing.lastSize) {
-    return; // No actual change
+    return;
   }
 
-  const projectHash = path.basename(path.dirname(transcriptPath));
+  const projectHash = getProjectHashFromPath(transcriptPath, claudeProjectsPath);
   const sessionId = path.basename(transcriptPath, ".jsonl");
 
   const session: SessionInfo = {
@@ -205,7 +316,6 @@ function handleTranscriptChange(transcriptPath: string) {
     lastSize: stat.size,
   };
 
-  // Clear previous debounce timer
   if (existing?.debounceTimer) {
     clearTimeout(existing.debounceTimer);
   }
@@ -225,13 +335,14 @@ function updateStatusBar() {
   statusBarItem.text = `$(comment-discussion) CodingChats (${active})`;
 }
 
+// --- Conversations repo management ---
+
 async function ensureConversationsRepo(): Promise<string> {
   const { conversationsRepoPath } = getConfig();
 
   if (!fs.existsSync(conversationsRepoPath)) {
     fs.mkdirSync(conversationsRepoPath, { recursive: true });
     await git(conversationsRepoPath, ["init"]);
-    // Create initial structure
     fs.mkdirSync(path.join(conversationsRepoPath, "sessions"), {
       recursive: true,
     });
@@ -268,29 +379,16 @@ async function git(
   }
 }
 
-function resolveProjectName(projectHash: string): string {
-  // Try to find the project name from the Claude projects directory structure.
-  // Claude Code uses the working directory path to create the hash, and often
-  // the project config contains the original path.
-  const { claudeProjectsPath } = getConfig();
-  const projectDir = path.join(claudeProjectsPath, projectHash);
+// --- Transcript helpers ---
 
-  // Check for a .project.json or similar metadata
-  const metaFiles = ["project.json", ".project.json", "config.json"];
-  for (const metaFile of metaFiles) {
-    const metaPath = path.join(projectDir, metaFile);
-    if (fs.existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
-        if (meta.name) return meta.name;
-        if (meta.directory) return path.basename(meta.directory);
-      } catch {
-        // Skip malformed files
-      }
-    }
+function extractDateFromTranscript(transcriptPath: string): string {
+  // Use the file's modification time to determine the date
+  try {
+    const stat = fs.statSync(transcriptPath);
+    return stat.mtime.toISOString().split("T")[0];
+  } catch {
+    return new Date().toISOString().split("T")[0];
   }
-
-  return projectHash;
 }
 
 function extractSummary(transcriptPath: string): string {
@@ -298,7 +396,6 @@ function extractSummary(transcriptPath: string): string {
     const content = fs.readFileSync(transcriptPath, "utf-8");
     const lines = content.trim().split("\n");
 
-    // Find the first user message for a summary
     for (const line of lines.slice(0, 20)) {
       try {
         const entry: TranscriptEntry = JSON.parse(line);
@@ -307,7 +404,6 @@ function extractSummary(transcriptPath: string): string {
             typeof entry.content === "string"
               ? entry.content
               : JSON.stringify(entry.content);
-          // Truncate and clean for use as a summary
           const clean = text
             .replace(/[\n\r]+/g, " ")
             .replace(/\|/g, "\\|")
@@ -324,36 +420,71 @@ function extractSummary(transcriptPath: string): string {
   }
 }
 
+/**
+ * Determine the relative destination path for a transcript within the conversations repo.
+ * Main sessions go to:  sessions/<owner>/<repo>/<date>-<sessionId>.jsonl
+ * Subagents go to:       sessions/<owner>/<repo>/subagents/<date>-<agentId>.jsonl
+ */
+function getDestRelPath(
+  session: SessionInfo,
+  projectName: string,
+  date: string
+): { relDir: string; filename: string } {
+  const { claudeProjectsPath } = getConfig();
+  const transcriptRel = path.relative(
+    path.join(claudeProjectsPath, session.projectHash),
+    session.transcriptPath
+  );
+  const parts = transcriptRel.split(path.sep);
+
+  // If path contains "subagents", preserve that structure
+  if (parts.includes("subagents")) {
+    return {
+      relDir: path.join("sessions", projectName, "subagents"),
+      filename: `${date}-${session.sessionId}.jsonl`,
+    };
+  }
+
+  return {
+    relDir: path.join("sessions", projectName),
+    filename: `${date}-${session.sessionId}.jsonl`,
+  };
+}
+
+// --- Core commit logic ---
+
 async function copyAndCommitSession(session: SessionInfo) {
   try {
     const repoPath = await ensureConversationsRepo();
-    const projectName = resolveProjectName(session.projectHash);
-    const date = new Date().toISOString().split("T")[0];
+    const projectName = await resolveProjectName(session.projectHash);
+    const date = extractDateFromTranscript(session.transcriptPath);
 
-    // Create project directory
-    const projectDir = path.join(repoPath, "sessions", projectName);
-    fs.mkdirSync(projectDir, { recursive: true });
+    const { relDir, filename } = getDestRelPath(session, projectName, date);
+    const destDir = path.join(repoPath, relDir);
+    fs.mkdirSync(destDir, { recursive: true });
 
-    // Copy transcript
-    const destFilename = `${date}-${session.sessionId}.jsonl`;
-    const destPath = path.join(projectDir, destFilename);
+    const destPath = path.join(destDir, filename);
     fs.copyFileSync(session.transcriptPath, destPath);
 
-    // Update index
-    const summary = extractSummary(session.transcriptPath);
-    const indexPath = path.join(repoPath, "INDEX.md");
-    const indexEntry = `| ${date} | ${projectName} | [${session.sessionId}](sessions/${projectName}/${destFilename}) | ${summary} |\n`;
+    // Update index (only for main sessions, not subagents)
+    if (!relDir.includes("subagents")) {
+      const summary = extractSummary(session.transcriptPath);
+      const indexPath = path.join(repoPath, "INDEX.md");
+      const indexEntry = `| ${date} | ${projectName} | [${session.sessionId}](${relDir}/${filename}) | ${summary} |\n`;
 
-    const indexContent = fs.readFileSync(indexPath, "utf-8");
-    // Insert after header row
-    const headerEnd = indexContent.indexOf("|\n", indexContent.lastIndexOf("---")) + 2;
-    const updatedIndex =
-      indexContent.substring(0, headerEnd) +
-      indexEntry +
-      indexContent.substring(headerEnd);
-    fs.writeFileSync(indexPath, updatedIndex);
+      const indexContent = fs.readFileSync(indexPath, "utf-8");
+      // Don't add duplicate entries
+      if (!indexContent.includes(session.sessionId)) {
+        const headerEnd =
+          indexContent.indexOf("|\n", indexContent.lastIndexOf("---")) + 2;
+        const updatedIndex =
+          indexContent.substring(0, headerEnd) +
+          indexEntry +
+          indexContent.substring(headerEnd);
+        fs.writeFileSync(indexPath, updatedIndex);
+      }
+    }
 
-    // Git add and commit
     await git(repoPath, ["add", "."]);
 
     // Check if there are staged changes
@@ -362,9 +493,10 @@ async function copyAndCommitSession(session: SessionInfo) {
       log(`No changes to commit for session ${session.sessionId}`);
       return;
     } catch {
-      // diff --cached --quiet exits non-zero when there are staged changes
+      // Has staged changes — continue
     }
 
+    const summary = extractSummary(session.transcriptPath);
     const commitMsg = `Add conversation: ${projectName} ${date}\n\nSession: ${session.sessionId}\nSummary: ${summary}`;
     await git(repoPath, ["commit", "-m", commitMsg]);
     log(`Committed session ${session.sessionId} for project ${projectName}`);
@@ -389,6 +521,239 @@ async function copyAndCommitSession(session: SessionInfo) {
     );
   }
 }
+
+// --- Import existing transcripts ---
+
+interface ImportCandidate {
+  projectHash: string;
+  projectName: string;
+  sessions: SessionInfo[];
+  totalSize: number;
+}
+
+async function gatherImportCandidates(): Promise<ImportCandidate[]> {
+  const { claudeProjectsPath, conversationsRepoPath } = getConfig();
+  if (!fs.existsSync(claudeProjectsPath)) return [];
+
+  // Figure out what's already been imported
+  const alreadyImported = new Set<string>();
+  const sessionsDir = path.join(conversationsRepoPath, "sessions");
+  if (fs.existsSync(sessionsDir)) {
+    collectImportedSessionIds(sessionsDir, alreadyImported);
+  }
+
+  const candidates: Map<string, ImportCandidate> = new Map();
+  const entries = fs.readdirSync(claudeProjectsPath, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const projectHash = entry.name;
+    const projectName = await resolveProjectName(projectHash);
+    const projectDir = path.join(claudeProjectsPath, projectHash);
+
+    const sessions: SessionInfo[] = [];
+    let totalSize = 0;
+    collectAllTranscripts(projectDir, projectHash, sessions, alreadyImported);
+    for (const s of sessions) {
+      totalSize += s.lastSize;
+    }
+
+    if (sessions.length > 0) {
+      candidates.set(projectHash, {
+        projectHash,
+        projectName,
+        sessions,
+        totalSize,
+      });
+    }
+  }
+
+  return Array.from(candidates.values());
+}
+
+function collectImportedSessionIds(dir: string, set: Set<string>) {
+  try {
+    const items = fs.readdirSync(dir, { withFileTypes: true });
+    for (const item of items) {
+      if (item.isFile() && item.name.endsWith(".jsonl")) {
+        // Filename format: <date>-<sessionId>.jsonl — extract sessionId
+        const match = item.name.match(/^\d{4}-\d{2}-\d{2}-(.+)\.jsonl$/);
+        if (match) set.add(match[1]);
+      } else if (item.isDirectory()) {
+        collectImportedSessionIds(path.join(dir, item.name), set);
+      }
+    }
+  } catch {
+    // skip
+  }
+}
+
+function collectAllTranscripts(
+  dir: string,
+  projectHash: string,
+  results: SessionInfo[],
+  alreadyImported: Set<string>
+) {
+  try {
+    const items = fs.readdirSync(dir, { withFileTypes: true });
+    for (const item of items) {
+      const fullPath = path.join(dir, item.name);
+      if (item.isFile() && item.name.endsWith(".jsonl")) {
+        const sessionId = item.name.replace(".jsonl", "");
+        if (alreadyImported.has(sessionId)) continue;
+        const stat = fs.statSync(fullPath);
+        if (stat.size < 100) continue; // Skip tiny/empty transcripts
+        results.push({
+          projectHash,
+          sessionId,
+          transcriptPath: fullPath,
+          lastSize: stat.size,
+        });
+      } else if (item.isDirectory()) {
+        collectAllTranscripts(fullPath, projectHash, results, alreadyImported);
+      }
+    }
+  } catch {
+    // skip
+  }
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+async function offerInitialImport() {
+  const { claudeProjectsPath } = getConfig();
+  if (!fs.existsSync(claudeProjectsPath)) {
+    extensionContext.globalState.update("hasOfferedImport", true);
+    return;
+  }
+
+  // Quick check: are there any transcripts?
+  let hasTranscripts = false;
+  try {
+    const entries = fs.readdirSync(claudeProjectsPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const files = fs.readdirSync(path.join(claudeProjectsPath, entry.name));
+      if (files.some((f) => f.endsWith(".jsonl"))) {
+        hasTranscripts = true;
+        break;
+      }
+    }
+  } catch {
+    // skip
+  }
+
+  if (!hasTranscripts) {
+    extensionContext.globalState.update("hasOfferedImport", true);
+    return;
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    "CodingChats found existing Claude Code conversations. Import them to your conversations repo?",
+    "Import All",
+    "Choose Projects",
+    "Skip"
+  );
+
+  extensionContext.globalState.update("hasOfferedImport", true);
+
+  if (choice === "Import All") {
+    await importExistingTranscripts();
+  } else if (choice === "Choose Projects") {
+    await importSelectiveTranscripts();
+  }
+}
+
+async function importExistingTranscripts() {
+  const candidates = await gatherImportCandidates();
+  if (candidates.length === 0) {
+    vscode.window.showInformationMessage(
+      "CodingChats: No new conversations to import."
+    );
+    return;
+  }
+
+  const totalSessions = candidates.reduce(
+    (n, c) => n + c.sessions.length,
+    0
+  );
+  const totalSize = candidates.reduce((n, c) => n + c.totalSize, 0);
+
+  const confirm = await vscode.window.showInformationMessage(
+    `Import ${totalSessions} conversation(s) from ${candidates.length} project(s) (${formatSize(totalSize)})?`,
+    "Import",
+    "Cancel"
+  );
+  if (confirm !== "Import") return;
+
+  await doImport(candidates);
+}
+
+async function importSelectiveTranscripts() {
+  const candidates = await gatherImportCandidates();
+  if (candidates.length === 0) {
+    vscode.window.showInformationMessage(
+      "CodingChats: No new conversations to import."
+    );
+    return;
+  }
+
+  const picks = candidates.map((c) => ({
+    label: c.projectName,
+    description: `${c.sessions.length} session(s), ${formatSize(c.totalSize)}`,
+    picked: true,
+    candidate: c,
+  }));
+
+  const selected = await vscode.window.showQuickPick(picks, {
+    canPickMany: true,
+    placeHolder: "Select projects to import conversations from",
+  });
+
+  if (!selected || selected.length === 0) return;
+
+  await doImport(selected.map((s) => s.candidate));
+}
+
+async function doImport(candidates: ImportCandidate[]) {
+  const totalSessions = candidates.reduce(
+    (n, c) => n + c.sessions.length,
+    0
+  );
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "CodingChats: Importing conversations",
+      cancellable: true,
+    },
+    async (progress, token) => {
+      let imported = 0;
+      for (const candidate of candidates) {
+        if (token.isCancellationRequested) break;
+        for (const session of candidate.sessions) {
+          if (token.isCancellationRequested) break;
+          progress.report({
+            message: `${candidate.projectName} (${imported + 1}/${totalSessions})`,
+            increment: (1 / totalSessions) * 100,
+          });
+          await copyAndCommitSession(session);
+          imported++;
+        }
+      }
+
+      vscode.window.showInformationMessage(
+        `CodingChats: Imported ${imported} conversation(s) from ${candidates.length} project(s).`
+      );
+    }
+  );
+}
+
+// --- Commands ---
 
 async function commitNow() {
   log("Manual commit triggered");
