@@ -121,7 +121,25 @@ The extension is designed to work across multiple computers sharing the same con
 - **Append-only INDEX.md**: new entries are appended at the end of the table, which minimizes merge conflicts when both machines commit concurrently
 - **Machine tracking**: each INDEX.md entry and commit message records the hostname, so you can see which machine produced each conversation
 
-If you're recreating your conversations repo to pick up the new INDEX.md format (which now includes a Machine column), just delete or rename the old one and let the extension re-initialize it, then re-import with **CodingChats: Import Existing Conversations**.
+On first install, the extension checks GitHub (via `gh`) for an existing `CodingChats-conversations` repo and offers to clone it automatically — so setting up a second machine is just "install the extension and accept the prompt."
+
+### Rebuilding from scratch
+
+If you need to start fresh (e.g. to pick up a new INDEX.md format), you can rebuild the conversations repo without losing any data. Your original transcripts are always preserved in `~/.claude/projects/`.
+
+1. **Delete or rename the old local repo:**
+   ```bash
+   mv ~/CodingChats-conversations ~/CodingChats-conversations.bak
+   ```
+
+2. **Optionally delete the GitHub repo too** (if you want a clean remote):
+   ```bash
+   gh repo delete CodingChats-conversations --yes
+   ```
+
+3. **Re-run setup** — open the command palette and run **CodingChats: Change Conversations Repo Location**. This re-runs the first-install flow: it will create a fresh repo (or let you create one on GitHub first and clone it).
+
+4. **Re-import all conversations** — open the command palette and run **CodingChats: Import Existing Conversations**. The extension scans `~/.claude/projects/` for all transcripts, skips any that are already in the repo (matched by session ID), and imports the rest. This is safe to run at any time — it won't create duplicates.
 
 ## Repository structure (conversations repo)
 
