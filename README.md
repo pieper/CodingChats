@@ -139,4 +139,4 @@ grep -rn "segmentation" coding-chats/sessions/
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
