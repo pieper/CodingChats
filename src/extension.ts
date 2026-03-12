@@ -66,13 +66,16 @@ export function activate(context: vscode.ExtensionContext) {
       importExistingTranscripts
     )
   );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codingChats.resetSetup", resetSetup)
+  );
 
-  startWatching();
-
-  // On first activation, offer to import existing transcripts
-  const hasImported = context.globalState.get<boolean>("hasOfferedImport");
-  if (!hasImported) {
-    offerInitialImport();
+  // On first activation, let user choose repo location, then offer import
+  const hasSetup = context.globalState.get<boolean>("hasCompletedSetup");
+  if (!hasSetup) {
+    initialSetup().then(() => startWatching());
+  } else {
+    startWatching();
   }
 
   context.subscriptions.push(
@@ -352,7 +355,7 @@ async function ensureConversationsRepo(): Promise<string> {
     );
     fs.writeFileSync(
       path.join(conversationsRepoPath, "INDEX.md"),
-      "# Coding Conversations Index\n\n| Date | Project | Session | Summary |\n|------|---------|---------|----------|\n"
+      "# Coding Conversations Index\n\n| Date | Machine | Project | Session | Summary |\n|------|---------|---------|---------|----------|\n"
     );
     await git(conversationsRepoPath, ["add", "."]);
     await git(conversationsRepoPath, [
@@ -376,6 +379,22 @@ async function git(
     const error = err as Error & { stdout?: string; stderr?: string };
     log(`git ${args.join(" ")} failed: ${error.message}`);
     throw error;
+  }
+}
+
+/**
+ * Pull remote changes with rebase if a remote is configured.
+ * This keeps multi-machine repos in sync and avoids push failures.
+ */
+async function pullIfRemote(repoPath: string) {
+  try {
+    const { stdout } = await git(repoPath, ["remote"]);
+    if (!stdout.trim()) return; // No remote configured
+    await git(repoPath, ["pull", "--rebase"]);
+    log("Pulled remote changes");
+  } catch (err: unknown) {
+    const error = err as Error;
+    log(`Pull failed (will continue with local commit): ${error.message}`);
   }
 }
 
@@ -469,21 +488,20 @@ async function copyAndCommitSession(session: SessionInfo) {
     // Update index (only for main sessions, not subagents)
     if (!relDir.includes("subagents")) {
       const summary = extractSummary(session.transcriptPath);
+      const machine = os.hostname();
       const indexPath = path.join(repoPath, "INDEX.md");
-      const indexEntry = `| ${date} | ${projectName} | [${session.sessionId}](${relDir}/${filename}) | ${summary} |\n`;
+      const indexEntry = `| ${date} | ${machine} | ${projectName} | [${session.sessionId}](${relDir}/${filename}) | ${summary} |\n`;
 
       const indexContent = fs.readFileSync(indexPath, "utf-8");
-      // Don't add duplicate entries
+      // Don't add duplicate entries; append at end for clean multi-machine merges
       if (!indexContent.includes(session.sessionId)) {
-        const headerEnd =
-          indexContent.indexOf("|\n", indexContent.lastIndexOf("---")) + 2;
-        const updatedIndex =
-          indexContent.substring(0, headerEnd) +
-          indexEntry +
-          indexContent.substring(headerEnd);
+        const updatedIndex = indexContent.trimEnd() + "\n" + indexEntry;
         fs.writeFileSync(indexPath, updatedIndex);
       }
     }
+
+    // Pull remote changes before committing to avoid conflicts across machines
+    await pullIfRemote(repoPath);
 
     await git(repoPath, ["add", "."]);
 
@@ -497,7 +515,8 @@ async function copyAndCommitSession(session: SessionInfo) {
     }
 
     const summary = extractSummary(session.transcriptPath);
-    const commitMsg = `Add conversation: ${projectName} ${date}\n\nSession: ${session.sessionId}\nSummary: ${summary}`;
+    const machine = os.hostname();
+    const commitMsg = `Add conversation: ${projectName} ${date}\n\nSession: ${session.sessionId}\nMachine: ${machine}\nSummary: ${summary}`;
     await git(repoPath, ["commit", "-m", commitMsg]);
     log(`Committed session ${session.sessionId} for project ${projectName}`);
 
@@ -506,8 +525,9 @@ async function copyAndCommitSession(session: SessionInfo) {
       try {
         await git(repoPath, ["push"]);
         log("Pushed to remote");
-      } catch {
-        log("Push failed — no remote configured or network error");
+      } catch (err: unknown) {
+        const error = err as Error;
+        log(`Push failed: ${error.message}`);
       }
     }
 
@@ -624,14 +644,64 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-async function offerInitialImport() {
-  const { claudeProjectsPath } = getConfig();
-  if (!fs.existsSync(claudeProjectsPath)) {
-    extensionContext.globalState.update("hasOfferedImport", true);
-    return;
+async function initialSetup() {
+  const defaultPath = path.join(os.homedir(), "CodingChats-conversations");
+  const config = vscode.workspace.getConfiguration("codingChats");
+
+  // If the user already configured a path in settings, skip the location prompt
+  const configuredPath = config.get<string>("conversationsRepoPath");
+  if (!configuredPath) {
+    const locationChoice = await vscode.window.showInformationMessage(
+      `CodingChats will store conversations in: ${defaultPath}`,
+      "Use Default",
+      "Choose Location",
+      "Select Existing Repo"
+    );
+
+    if (locationChoice === "Choose Location") {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: "Select folder for conversations repo",
+        title: "Choose where to create the CodingChats conversations repo",
+      });
+      if (picked && picked.length > 0) {
+        const chosenPath = picked[0].fsPath;
+        await config.update(
+          "conversationsRepoPath",
+          chosenPath,
+          vscode.ConfigurationTarget.Global
+        );
+        log(`Conversations repo path set to: ${chosenPath}`);
+      }
+    } else if (locationChoice === "Select Existing Repo") {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: "Select existing conversations repo",
+        title: "Select an existing CodingChats conversations repo",
+      });
+      if (picked && picked.length > 0) {
+        const chosenPath = picked[0].fsPath;
+        await config.update(
+          "conversationsRepoPath",
+          chosenPath,
+          vscode.ConfigurationTarget.Global
+        );
+        log(`Conversations repo path set to existing repo: ${chosenPath}`);
+      }
+    }
+    // "Use Default" or dismissed — leave the setting empty so getConfig() uses the default
   }
 
-  // Quick check: are there any transcripts?
+  extensionContext.globalState.update("hasCompletedSetup", true);
+
+  // Now offer to import existing transcripts
+  const { claudeProjectsPath } = getConfig();
+  if (!fs.existsSync(claudeProjectsPath)) return;
+
   let hasTranscripts = false;
   try {
     const entries = fs.readdirSync(claudeProjectsPath, { withFileTypes: true });
@@ -647,25 +717,30 @@ async function offerInitialImport() {
     // skip
   }
 
-  if (!hasTranscripts) {
-    extensionContext.globalState.update("hasOfferedImport", true);
-    return;
-  }
+  if (!hasTranscripts) return;
 
-  const choice = await vscode.window.showInformationMessage(
-    "CodingChats found existing Claude Code conversations. Import them to your conversations repo?",
+  const importChoice = await vscode.window.showInformationMessage(
+    "CodingChats found existing Claude Code conversations. Import them?",
     "Import All",
     "Choose Projects",
     "Skip"
   );
 
-  extensionContext.globalState.update("hasOfferedImport", true);
-
-  if (choice === "Import All") {
+  if (importChoice === "Import All") {
     await importExistingTranscripts();
-  } else if (choice === "Choose Projects") {
+  } else if (importChoice === "Choose Projects") {
     await importSelectiveTranscripts();
   }
+}
+
+async function resetSetup() {
+  extensionContext.globalState.update("hasCompletedSetup", false);
+  stopWatching();
+  await initialSetup();
+  startWatching();
+  vscode.window.showInformationMessage(
+    `CodingChats: Now using ${getConfig().conversationsRepoPath}`
+  );
 }
 
 async function importExistingTranscripts() {

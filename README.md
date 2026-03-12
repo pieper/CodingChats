@@ -27,8 +27,8 @@ touch sessions/.gitkeep
 cat > INDEX.md << 'EOF'
 # Coding Conversations Index
 
-| Date | Project | Session | Summary |
-|------|---------|---------|---------|
+| Date | Machine | Project | Session | Summary |
+|------|---------|---------|---------|---------|
 EOF
 git add .
 git commit -m "Initial conversations repo"
@@ -69,7 +69,9 @@ After installing, reload the window (**Cmd+Shift+P** / **Ctrl+Shift+P** → **De
 
 ### 4. Configure (optional)
 
-The extension works with zero configuration — it will create `~/CodingChats-conversations` automatically if it doesn't exist. To point it at your cloned GitHub repo instead:
+On first activation, the extension will prompt you to choose where to store conversations — you can use the default (`~/CodingChats-conversations`), pick a custom location, or point it at an existing repo. To change this later, run **CodingChats: Change Conversations Repo Location** from the command palette.
+
+You can also configure settings directly in `settings.json`:
 
 Open VS Code Settings and search for "CodingChats", or add to your `settings.json`:
 
@@ -108,6 +110,18 @@ git push
 - **CodingChats: Commit Conversations Now** — immediately commit all tracked sessions
 - **CodingChats: Open Latest Conversation** — open the INDEX.md in the conversations repo
 - **CodingChats: Show Status** — show tracking status in the output panel
+- **CodingChats: Import Existing Conversations** — import transcripts from Claude Code's projects directory
+- **CodingChats: Change Conversations Repo Location** — re-run the initial setup dialog to pick a new repo location (useful if you moved or deleted the conversations repo, or want to switch to a different one)
+
+## Multi-machine support
+
+The extension is designed to work across multiple computers sharing the same conversations repo via git. Enable `autoPush` on each machine, and:
+
+- **Pull before commit**: the extension automatically pulls remote changes (with rebase) before each commit, so changes from other machines are incorporated
+- **Append-only INDEX.md**: new entries are appended at the end of the table, which minimizes merge conflicts when both machines commit concurrently
+- **Machine tracking**: each INDEX.md entry and commit message records the hostname, so you can see which machine produced each conversation
+
+If you're recreating your conversations repo to pick up the new INDEX.md format (which now includes a Machine column), just delete or rename the old one and let the extension re-initialize it, then re-import with **CodingChats: Import Existing Conversations**.
 
 ## Repository structure (conversations repo)
 
