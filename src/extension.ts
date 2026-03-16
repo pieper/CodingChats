@@ -7,6 +7,15 @@ import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
 
+// Simple async mutex to serialize git operations and avoid index.lock conflicts
+let gitMutexQueue: Promise<void> = Promise.resolve();
+function withGitLock<T>(fn: () => Promise<T>): Promise<T> {
+  const result = gitMutexQueue.then(fn, fn);
+  // Update the queue to wait for this operation (swallow errors so queue continues)
+  gitMutexQueue = result.then(() => {}, () => {});
+  return result;
+}
+
 interface TranscriptEntry {
   type?: string;
   role?: string;
@@ -473,6 +482,7 @@ function getDestRelPath(
 // --- Core commit logic ---
 
 async function copyAndCommitSession(session: SessionInfo) {
+  return withGitLock(async () => {
   try {
     const repoPath = await ensureConversationsRepo();
     const projectName = await resolveProjectName(session.projectHash);
@@ -540,6 +550,7 @@ async function copyAndCommitSession(session: SessionInfo) {
       `CodingChats: Failed to commit conversation — ${error.message}`
     );
   }
+  });
 }
 
 // --- Import existing transcripts ---
