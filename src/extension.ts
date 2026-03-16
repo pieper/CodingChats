@@ -399,11 +399,26 @@ async function pullIfRemote(repoPath: string) {
   try {
     const { stdout } = await git(repoPath, ["remote"]);
     if (!stdout.trim()) return; // No remote configured
-    await git(repoPath, ["pull", "--rebase"]);
+    await git(repoPath, ["pull", "--rebase", "--autostash"]);
     log("Pulled remote changes");
   } catch (err: unknown) {
     const error = err as Error;
-    log(`Pull failed (will continue with local commit): ${error.message}`);
+    log(`Pull --rebase failed: ${error.message}`);
+    // If rebase left us in a conflicted state, abort and fall back to merge
+    try {
+      await git(repoPath, ["rebase", "--abort"]);
+      log("Aborted failed rebase, retrying with merge strategy");
+    } catch {
+      // Not mid-rebase — that's fine
+    }
+    try {
+      await git(repoPath, ["pull", "--no-rebase", "--autostash",
+        "-X", "theirs"]);
+      log("Pulled remote changes via merge (theirs strategy)");
+    } catch (mergeErr: unknown) {
+      const mergeError = mergeErr as Error;
+      log(`Merge pull also failed (will continue with local commit): ${mergeError.message}`);
+    }
   }
 }
 
